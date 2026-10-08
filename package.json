@@ -1,0 +1,23 @@
+{
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.35"
+  },
+  "description": "Plugin orkestrasi multi-agent untuk opencode: pecah tugas jadi unit independen, klaim file anti-tabrakan, spawn worker paralel, verifikasi hasil.",
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  },
+  "files": ["dist", "prompt", "src", "README.md", "LICENSE"],
+  "keywords": ["opencode", "plugin", "multi-agent", "orchestration"],
+  "license": "MIT",
+  "main": "dist/orkestra.js",
+  "name": "opencode-orkestra",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

@@ -1,0 +1,5 @@
+node_modules/
+src/prompts.gen.ts
+.opencode/orkestra/
+*.log
+.DS_Store
