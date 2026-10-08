@@ -7,27 +7,30 @@
  * - Agen `tukang` (subagent): worker satu unit kerja, di-spawn mandor via `task`.
  * - Command `/orkestra <tugas>`: menjalankan workflow orkestrasi.
  * - Tools: `orkestra_claim`, `orkestra_release`, `orkestra_status`.
- * - Guard `tool.execute.before`: menolak write/edit ke file yang diklaim sesi lain.
+ * - Guard `tool.execute.before`: menolak write/edit ke file yang diklaim sesi lain,
+ *   termasuk upaya bypass lewat shell (heuristic: sed -i, redirect >, rm/mv/tee).
  * - Event `session.deleted`: klaim sesi yang mati otomatis dilepas.
+ * - Klaim kedaluwarsa otomatis (TTL 6 jam) agar tidak menggantung bila crash.
  */
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { isAbsolute, resolve } from "node:path";
-import { ClaimRegistry, guardWrite } from "./claims.js";
+import { resolve } from "node:path";
+import { ClaimRegistry, DEFAULT_CLAIM_TTL_MS, guardBashWrite, guardWrite, rel } from "./claims.js";
 import { PERINTAH_ORKESTRA, PROMPT_MANDOR, PROMPT_TUKANG } from "./prompts.gen.js";
 
 const ORKESTRA_DIRNAME = "orkestra";
 
-function rel(root: string, p: string): string {
-  const abs = isAbsolute(p) ? p : resolve(root, p);
-  const r = abs.startsWith(root + "/") ? abs.slice(root.length + 1) : abs;
-  return r;
+/** Umur klaim dalam format ringkas, mis. "3m", "2j". */
+function ageShort(at: number): string {
+  const m = Math.max(0, Math.round((Date.now() - at) / 60000));
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}j`;
 }
 
 export const OrkestraPlugin: Plugin = async (ctx) => {
   const projectDir = ctx.directory || process.cwd();
   const persistPath = resolve(projectDir, ".opencode", ORKESTRA_DIRNAME, "claims.json");
-  const registry = new ClaimRegistry(persistPath);
+  const registry = new ClaimRegistry(persistPath, DEFAULT_CLAIM_TTL_MS);
   // sessionID -> direktori kerja sesi (untuk resolve path relatif di guard)
   const sessionDirs = new Map<string, string>();
 
@@ -100,7 +103,8 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
           force: tool.schema.boolean().optional().describe("true = mandor boleh melepas klaim milik sesi lain"),
         },
         async execute(args, tctx) {
-          const n = registry.release(args.target, tctx.sessionID, args.force === true);
+          const cwd = tctx.directory || tctx.worktree || projectDir;
+          const n = registry.release(args.target, tctx.sessionID, args.force === true, cwd);
           return n > 0
             ? `OK: ${n} klaim dilepas untuk "${args.target}".`
             : `Tidak ada klaim yang cocok dengan "${args.target}" milik sesimu.` +
@@ -116,11 +120,11 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
           const list = registry.list();
           if (list.length === 0) return "Tidak ada klaim aktif. Semua file bebas ditulis.";
           return (
-            `Klaim aktif (${list.length}):\n` +
+            `Klaim aktif (${list.length}, kedaluwarsa otomatis ${DEFAULT_CLAIM_TTL_MS / 3600000} jam):\n` +
             list
               .map(
                 (c) =>
-                  `- ${rel(root, c.path)} → tugas "${c.owner}"` +
+                  `- ${rel(root, c.path)} → tugas "${c.owner}" (${ageShort(c.at)})` +
                   (c.sessionID === tctx.sessionID ? " (milikmu)" : ""),
               )
               .join("\n")
@@ -130,13 +134,14 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
     },
 
     "tool.execute.before": async (input, output) => {
-      const verdict = guardWrite(
-        input.tool,
-        output.args ?? {},
-        input.sessionID,
-        registry,
-        dirOf(input.sessionID),
-      );
+      const cwd = dirOf(input.sessionID);
+      if (input.tool === "bash") {
+        // Heuristic: cegah bypass lewat shell (sed -i, redirect >, rm, ...).
+        const v = guardBashWrite(String(output.args?.command ?? ""), input.sessionID, registry, cwd);
+        if (v.blocked) throw new Error(v.blocked);
+        return;
+      }
+      const verdict = guardWrite(input.tool, output.args ?? {}, input.sessionID, registry, cwd);
       if (verdict.blocked) throw new Error(verdict.blocked);
     },
 
