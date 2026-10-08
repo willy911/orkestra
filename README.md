@@ -52,7 +52,20 @@ Aturannya juga menangkap kasus tidak langsung: mengklaim direktori `src/auth` me
 
 ## Instalasi
 
-### Opsi A — dari source (satu perintah build)
+### Opsi A — via npm (paling gampang, direkomendasikan)
+
+Tambahkan ke `opencode.json` (global di `~/.config/opencode/opencode.json`, atau per proyek):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-orkestra"]
+}
+```
+
+opencode menginstall otomatis via bun saat startup. Restart opencode, selesai.
+
+### Opsi B — dari source
 
 ```bash
 git clone https://github.com/willy911/orkestra.git
@@ -66,18 +79,6 @@ Lalu copy hasilnya ke folder plugin opencode:
 - Per proyek: `<proyek>/.opencode/plugins/orkestra.js`
 
 Restart opencode. Selesai.
-
-### Opsi B — via npm (setelah publish)
-
-```jsonc
-// ~/.config/opencode/opencode.json (global) atau opencode.json (proyek)
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-orkestra"]
-}
-```
-
-opencode menginstall otomatis via bun saat startup.
 
 ### Cek instalasi
 

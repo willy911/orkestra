@@ -13,8 +13,10 @@
   "license": "MIT",
   "main": "dist/orkestra.js",
   "name": "opencode-orkestra",
+  "publishConfig": { "access": "public" },
   "scripts": {
     "build": "bun scripts/build.ts",
+    "prepublishOnly": "bun run build",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit"
   },
