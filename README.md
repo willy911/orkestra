@@ -126,14 +126,16 @@ Prompt di `prompt/*.md` adalah sumber kebenaran — `bun run build` meng-embed-n
 ```bash
 bun install        # install dependensi
 bun run build      # generate prompts + bundle dist/orkestra.js
-bun test           # 23 unit test (claim registry, guard, edge cases)
+bun test           # 40 unit test (claim registry, guard write/bash, TTL, refresh, edge cases)
 bun run typecheck  # tsc --noEmit
 ```
 
-Terverifikasi: 23 test lolos, `tsc` bersih, dan bundle ter-load di opencode 1.18.35 asli (agen `mandor`/`tukang` + command `/orkestra` terdaftar via API, alur claim → blokir → release → auto-release sesi mati teruji end-to-end).
+Terverifikasi: 40 test lolos, `tsc` bersih, dan bundle ter-load di opencode 1.18.35 asli (agen `mandor`/`tukang` + command `/orkestra` terdaftar via API, alur claim → blokir → release → auto-release sesi mati teruji end-to-end).
 
 ## Catatan
 
-- Klaim disimpan di `<proyek>/.opencode/orkestra/claims.json` (persist antar restart).
+- Klaim disimpan di `<proyek>/.opencode/orkestra/claims.json` (persist antar restart; ditulis atomik, di-reload tiap operasi agar dua proses opencode tidak saling menimpa).
+- Klaim kedaluwarsa otomatis setelah 6 jam (mencegah klaim menggantung bila opencode crash); umurnya tampil di `orkestra_status`.
 - Jika worker mati tanpa melepas klaim, mandor bisa melepas paksa: `orkestra_release` dengan `force: true`.
+- Perintah shell juga diawasi (heuristic): `sed -i`, redirect `>`, `rm`, `mv`, `tee`, `git checkout --`, dsb. yang menarget file klaim akan ditolak. Ini bukan parsing shell yang sempurna — tetap tulis file via tool write/edit. Operasi baca (`grep`/`cat`) tidak tersentuh.
 - Guard bersifat fail-open untuk path relatif yang tidak bisa di-resolve — tukang diinstruksikan memakai path absolut.

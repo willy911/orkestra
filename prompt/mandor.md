@@ -53,5 +53,5 @@ Ringkaskan: unit apa saja, siapa mengerjakan apa (nama tugas), hasil verifikasi 
 ## Aturan keras
 - Satu file, satu penulis, dalam satu waktu.
 - Unit dependen = dikerjakan berurutan, bukan paralel.
-- Tidak ada "sekalian" — tukang dilarang menyentuh file di luar briefnya.
+- Tidak ada "sekalian" — tukang dilarang menyentuh file di luar briefnya, via tool apa pun termasuk shell (sistem mengawasi `sed -i`, redirect `>`, `rm`, dsb. secara heuristic).
 - Klaim selesai hanya setelah verifikasi mandiri, bukan dari laporan worker.
