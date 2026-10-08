@@ -52,14 +52,20 @@ Aturannya juga menangkap kasus tidak langsung: mengklaim direktori `src/auth` me
 
 ## Instalasi
 
-### Opsi A — satu file, tanpa install (paling gampang)
+### Opsi A — dari source (satu perintah build)
 
-Download [`dist/orkestra.js`](dist/orkestra.js), taruh di folder plugin opencode:
+```bash
+git clone https://github.com/willy911/orkestra.git
+cd orkestra
+bun install && bun run build
+```
 
-- Global (semua proyek): `~/.config/opencode/plugins/orkestra.js`
+Lalu copy hasilnya ke folder plugin opencode:
+
+- Global (semua proyek): `~/.config/opencode/plugins/orkestra.js` ← dari `dist/orkestra.js`
 - Per proyek: `<proyek>/.opencode/plugins/orkestra.js`
 
-Restart opencode. Selesai — tidak perlu `npm install` apa pun.
+Restart opencode. Selesai.
 
 ### Opsi B — via npm (setelah publish)
 
