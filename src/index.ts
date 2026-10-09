@@ -15,10 +15,13 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolve } from "node:path";
-import { ClaimRegistry, DEFAULT_CLAIM_TTL_MS, guardBashWrite, guardWrite, rel } from "./claims.js";
+import { ClaimRegistry, DEFAULT_CLAIM_TTL_MS, guardBashWrite, guardWrite, isWriteTool, rel } from "./claims.js";
 import { PERINTAH_ORKESTRA, PROMPT_MANDOR, PROMPT_TUKANG } from "./prompts.gen.js";
 
 const ORKESTRA_DIRNAME = "orkestra";
+
+/** Nama tool shell yang diawasi guard (opencode memakai "bash"; sisanya jaga-jaga). */
+const SHELL_TOOLS = new Set(["bash", "sh", "powershell", "pwsh", "run_command"]);
 
 /** Umur klaim dalam format ringkas, mis. "3m", "2j". */
 function ageShort(at: number): string {
@@ -135,14 +138,18 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
 
     "tool.execute.before": async (input, output) => {
       const cwd = dirOf(input.sessionID);
-      if (input.tool === "bash") {
+      if (SHELL_TOOLS.has(input.tool)) {
         // Heuristic: cegah bypass lewat shell (sed -i, redirect >, rm, ...).
         const v = guardBashWrite(String(output.args?.command ?? ""), input.sessionID, registry, cwd);
         if (v.blocked) throw new Error(v.blocked);
-        return;
+      } else {
+        const verdict = guardWrite(input.tool, output.args ?? {}, input.sessionID, registry, cwd);
+        if (verdict.blocked) throw new Error(verdict.blocked);
       }
-      const verdict = guardWrite(input.tool, output.args ?? {}, input.sessionID, registry, cwd);
-      if (verdict.blocked) throw new Error(verdict.blocked);
+      // Sliding TTL: sesi yang masih aktif menulis tidak kehilangan klaimnya.
+      if (input.sessionID && (SHELL_TOOLS.has(input.tool) || isWriteTool(input.tool))) {
+        registry.touch(input.sessionID);
+      }
     },
 
     event: async ({ event }) => {

@@ -3,9 +3,9 @@
  * Jalankan: bun test
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import {
   ClaimRegistry,
   DEFAULT_CLAIM_TTL_MS,
@@ -492,7 +492,174 @@ describe("release dengan cwd", () => {
 describe("rel()", () => {
   test("memotong prefix root dengan separator platform", () => {
     expect(rel("/p/root", "/p/root/src/a.ts")).toBe(join("src", "a.ts"));
-    expect(rel("/p/root", "/lain/x.ts")).toBe("/lain/x.ts");
+    // di luar root → kembalikan absolut ternormalisasi (jangan hardcode slash POSIX)
+    expect(rel("/p/root", "/lain/x.ts")).toBe(normalize("/lain/x.ts"));
     expect(rel("/p/root/", "/p/root/src/a.ts")).toBe(join("src", "a.ts"));
+  });
+});
+
+describe("guardBashWrite v0.1.2 — bypass lanjutan", () => {
+  function bashReg2() {
+    const { reg, dir, cleanup } = freshRegistry();
+    reg.claim(["src/a.ts"], "tugas-1", A, dir);
+    return { reg, dir, cleanup };
+  }
+  const P = (dir: string, p: string) => join(dir, p);
+
+  test("git restore / git checkout tanpa -- ke file klaim = DIBLOKIR", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      for (const cmd of [
+        `git restore ${P(dir, "src/a.ts")}`,
+        `git checkout ${P(dir, "src/a.ts")}`,
+        `git checkout HEAD -- ${P(dir, "src/a.ts")}`,
+      ]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toContain("tugas-1");
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("git checkout branch / restore --staged = LOLOS", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      for (const cmd of [`git checkout main`, `git checkout -b fitur-x`, `git restore --staged .`, `git status`]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toBeUndefined();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("curl -o / wget -O ke file klaim = DIBLOKIR; unduh biasa = lolos", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      expect(guardBashWrite(`curl -sL -o ${P(dir, "src/a.ts")} https://x/y`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`wget -q -O ${P(dir, "src/a.ts")} https://x/y`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`curl -sL https://x/y | tar -tzf -`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("rsync dan ln ke file klaim = DIBLOKIR", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      expect(guardBashWrite(`rsync -a /tmp/x/ ${P(dir, "src/a.ts")}`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`ln -sf /tmp/other ${P(dir, "src/a.ts")}`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`rsync -a /tmp/x/ /tmp/y/`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("patch / git apply / tar -x / unzip / find -delete = DIBLOKIR bila ada klaim asing", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      for (const cmd of [
+        `patch -p1 < /tmp/p.diff`,
+        `git apply /tmp/p.diff`,
+        `tar -xzf /tmp/a.tgz`,
+        `unzip -o /tmp/a.zip`,
+        `find src -name '*.tmp' -delete`,
+      ]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toBeDefined();
+      }
+      // tanpa klaim asing → lolos
+      const { reg: r2, dir: d2, cleanup: c2 } = freshRegistry();
+      try {
+        expect(guardBashWrite(`tar -xzf /tmp/a.tgz`, B, r2, d2).blocked).toBeUndefined();
+        expect(guardBashWrite(`unzip -l /tmp/a.zip`, B, reg, dir).blocked).toBeUndefined(); // -l = list only
+      } finally {
+        c2();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("xargs rm dengan path klaim di pipa = DIBLOKIR; xargs echo = lolos", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      const v = guardBashWrite(`echo ${P(dir, "src/a.ts")} | xargs rm -f`, B, reg, dir);
+      expect(v.blocked).toContain("tugas-1");
+      const opaque = guardBashWrite(`find . -name '*.log' | xargs rm -f`, B, reg, dir);
+      expect(opaque.blocked).toBeDefined(); // konservatif: target tak terlihat
+      expect(guardBashWrite(`echo hello | xargs echo`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("python -c / node -e yang menulis path klaim = DIBLOKIR; yang baca = lolos", () => {
+    const { reg, dir, cleanup } = bashReg2();
+    try {
+      const w1 = guardBashWrite(`python3 -c "open('${P(dir, "src/a.ts")}', 'w').write('x')"`, B, reg, dir);
+      expect(w1.blocked).toContain("tugas-1");
+      const w2 = guardBashWrite(`node -e "require('fs').writeFileSync('${P(dir, "src/a.ts")}', 'x')"`, B, reg, dir);
+      expect(w2.blocked).toContain("tugas-1");
+      expect(guardBashWrite(`python3 -c "print('hi')"`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`node -e "console.log('hi')"`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("touch() sliding TTL", () => {
+  test("touch memperbarui at klaim sesi sendiri", () => {
+    const dir = mkdtempSync(join(tmpdir(), "orkestra-test-"));
+    try {
+      const persist = join(dir, "claims.json");
+      const old = { path: join(dir, "src/a.ts"), owner: "t", sessionID: A, at: Date.now() - 3600000 };
+      writeFileSync(persist, JSON.stringify([old]));
+      const reg = new ClaimRegistry(persist, DEFAULT_CLAIM_TTL_MS);
+      // paksa throttle lewat: at sudah 1 jam lalu → touch menulis ulang
+      reg.touch(A);
+      const c = reg.list()[0];
+      expect(Date.now() - c.at).toBeLessThan(120000);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("touch tidak menyentuh klaim sesi lain", () => {
+    const { reg, dir, cleanup } = freshRegistry();
+    try {
+      reg.claim(["src/a.ts"], "t1", A, dir);
+      reg.claim(["src/b.ts"], "t2", B, dir);
+      const beforeB = reg.list().find((c) => c.owner === "t2")!.at;
+      reg.touch(A);
+      const afterB = reg.list().find((c) => c.owner === "t2")!.at;
+      expect(afterB).toBe(beforeB);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("lockfile antar proses", () => {
+  test("tidak ada file .lock menggantung setelah claim", () => {
+    const { reg, dir, cleanup } = freshRegistry();
+    try {
+      reg.claim(["src/a.ts"], "t1", A, dir);
+      expect(existsSync(join(dir, "claims.json.lock"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("lock basi (>5 detik) dicuri, bukan deadlock", () => {
+    const dir = mkdtempSync(join(tmpdir(), "orkestra-test-"));
+    try {
+      const persist = join(dir, "claims.json");
+      writeFileSync(persist + ".lock", `99999:${Date.now() - 60000}`);
+      const reg = new ClaimRegistry(persist);
+      const r = reg.claim(["src/a.ts"], "t1", A, dir);
+      expect(r.ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

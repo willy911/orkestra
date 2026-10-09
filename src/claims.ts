@@ -9,8 +9,8 @@
  *
  * Modul ini murni (tidak bergantung API opencode) supaya bisa di-unit-test.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, normalize, resolve, sep } from "node:path";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
 
 export interface Claim {
   /** path absolut yang diklaim (file atau direktori) */
@@ -72,6 +72,7 @@ export const DEFAULT_CLAIM_TTL_MS = 6 * 3600 * 1000;
 
 export class ClaimRegistry {
   private claims = new Map<string, Claim>();
+  private lastTouchAt = new Map<string, number>();
 
   constructor(
     private persistPath?: string,
@@ -105,26 +106,27 @@ export class ClaimRegistry {
 
   /** Klaim satu atau beberapa path untuk sebuah tugas. Path relatif di-resolve terhadap cwd. */
   claim(paths: string[], owner: string, sessionID: string, cwd?: string): ClaimResult {
-    this.refresh();
-    for (const raw of paths) {
-      const abs = norm(isAbsolute(raw) ? raw : resolve(cwd ?? process.cwd(), raw));
-      for (const c of this.claims.values()) {
-        if (c.sessionID !== sessionID && overlaps(c.path, abs) && c.owner !== owner) {
-          return { ok: false, conflict: c };
+    return this.mutate(() => {
+      for (const raw of paths) {
+        const abs = norm(isAbsolute(raw) ? raw : resolve(cwd ?? process.cwd(), raw));
+        for (const c of this.claims.values()) {
+          if (c.sessionID !== sessionID && overlaps(c.path, abs) && c.owner !== owner) {
+            return { ok: false, conflict: c };
+          }
         }
       }
-    }
-    const at = Date.now();
-    for (const raw of paths) {
-      const abs = norm(isAbsolute(raw) ? raw : resolve(cwd ?? process.cwd(), raw));
-      // Klaim ulang oleh owner yang sama (mis. retry dari sesi baru) = pindah kepemilikan, bukan konflik.
-      for (const [k, c] of this.claims) {
-        if (c.owner === owner && overlaps(c.path, abs)) this.claims.delete(k);
+      const at = Date.now();
+      for (const raw of paths) {
+        const abs = norm(isAbsolute(raw) ? raw : resolve(cwd ?? process.cwd(), raw));
+        // Klaim ulang oleh owner yang sama (mis. retry dari sesi baru) = pindah kepemilikan, bukan konflik.
+        for (const [k, c] of this.claims) {
+          if (c.owner === owner && overlaps(c.path, abs)) this.claims.delete(k);
+        }
+        this.claims.set(abs, { path: abs, owner, sessionID, at });
       }
-      this.claims.set(abs, { path: abs, owner, sessionID, at });
-    }
-    this.save();
-    return { ok: true };
+      this.save();
+      return { ok: true };
+    });
   }
 
   /**
@@ -132,33 +134,57 @@ export class ClaimRegistry {
    * atau nama owner. Mengembalikan jumlah klaim yang dilepas.
    */
   release(target: string, sessionID: string, force = false, cwd?: string): number {
-    this.refresh();
-    let n = 0;
-    const absTarget = norm(isAbsolute(target) ? target : resolve(cwd ?? process.cwd(), target));
-    for (const [k, c] of this.claims) {
-      const byOwner = c.owner === target;
-      const byPath = overlaps(c.path, absTarget);
-      if ((byOwner || byPath) && (force || c.sessionID === sessionID)) {
-        this.claims.delete(k);
-        n++;
+    return this.mutate(() => {
+      let n = 0;
+      const absTarget = norm(isAbsolute(target) ? target : resolve(cwd ?? process.cwd(), target));
+      for (const [k, c] of this.claims) {
+        const byOwner = c.owner === target;
+        const byPath = overlaps(c.path, absTarget);
+        if ((byOwner || byPath) && (force || c.sessionID === sessionID)) {
+          this.claims.delete(k);
+          n++;
+        }
       }
-    }
-    if (n > 0) this.save();
-    return n;
+      if (n > 0) this.save();
+      return n;
+    });
   }
 
   /** Lepas semua klaim milik sebuah sesi (dipanggil saat sesi dihapus). */
   releaseSession(sessionID: string): number {
-    this.refresh();
-    let n = 0;
-    for (const [k, c] of this.claims) {
-      if (c.sessionID === sessionID) {
-        this.claims.delete(k);
-        n++;
+    return this.mutate(() => {
+      let n = 0;
+      for (const [k, c] of this.claims) {
+        if (c.sessionID === sessionID) {
+          this.claims.delete(k);
+          n++;
+        }
       }
-    }
-    if (n > 0) this.save();
-    return n;
+      if (n > 0) this.save();
+      return n;
+    });
+  }
+
+  /**
+   * Perbarui `at` klaim milik sebuah sesi = sliding TTL. Sesi yang masih
+   * aktif (menulis via tool) tidak akan kehilangan klaim di tengah jalan;
+   * sesi yang mati/crash berhenti menyentuh → kedaluwarsa normal.
+   * Di-throttle 60 detik per sesi agar tidak menulis disk tiap tool call.
+   */
+  touch(sessionID: string): void {
+    const now = Date.now();
+    if (now - (this.lastTouchAt.get(sessionID) ?? 0) < 60000) return;
+    this.lastTouchAt.set(sessionID, now);
+    this.mutate(() => {
+      let dirty = false;
+      for (const c of this.claims.values()) {
+        if (c.sessionID === sessionID) {
+          c.at = now;
+          dirty = true;
+        }
+      }
+      if (dirty) this.save();
+    });
   }
 
   /** Cek apakah sesi boleh menulis ke path absolut ini. */
@@ -174,6 +200,56 @@ export class ClaimRegistry {
   list(): Claim[] {
     this.refresh();
     return [...this.claims.values()].sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * Jalankan mutasi di dalam lock antar-proses: refresh → ubah → save.
+   * Menutup race Lost Update bila dua proses opencode mengklaim bersamaan.
+   * Lock basi (>5 detik, mis. proses crash) otomatis dicuri.
+   */
+  private mutate<T>(fn: () => T): T {
+    if (!this.acquireLock()) return fn(); // best-effort tanpa lock
+    try {
+      this.refresh();
+      return fn();
+    } finally {
+      this.releaseLock();
+    }
+  }
+
+  private lockPath(): string {
+    return `${this.persistPath}.lock`;
+  }
+
+  private acquireLock(): boolean {
+    if (!this.persistPath) return true;
+    const lp = this.lockPath();
+    try {
+      const fd = openSync(lp, "wx"); // O_CREAT|O_EXCL: gagal bila sudah ada
+      writeSync(fd, `${process.pid}:${Date.now()}`);
+      closeSync(fd);
+      return true;
+    } catch {
+      try {
+        const ts = parseInt(readFileSync(lp, "utf8").split(":")[1] || "0", 10);
+        if (Date.now() - ts > 5000) {
+          rmSync(lp, { force: true });
+          return this.acquireLock();
+        }
+      } catch {
+        /* abaikan, jalan tanpa lock */
+      }
+      return false;
+    }
+  }
+
+  private releaseLock(): void {
+    if (!this.persistPath) return;
+    try {
+      rmSync(this.lockPath(), { force: true });
+    } catch {
+      /* abaikan */
+    }
   }
 
   private save(): void {
@@ -232,7 +308,7 @@ export function guardWrite(
 
 interface BashVerb {
   re: RegExp;
-  /** true = hanya token path TERAKHIR yang dicek (cp/install: destinasinya) */
+  /** true = hanya token path TERAKHIR yang dicek (cp/install/rsync: destinasinya) */
   lastOnly?: boolean;
 }
 
@@ -245,8 +321,34 @@ const BASH_VERBS: BashVerb[] = [
   { re: /\binstall\s+/, lastOnly: true }, // install: hanya destinasi
   { re: /\btruncate\s+(-s\s+\S+\s+)?/ },
   { re: /\bdd\s+(?=[^;&|]*\bof=)/ },
-  { re: /\bgit\s+(checkout|restore)\s+(?=[^;&|]*--\s)/ }, // git checkout -- <path>
+  // git checkout/restore: dengan `--`, atau path ber-ekstensi (tanpa --).
+  // `git checkout main`, `git checkout -b x`, `git restore --staged` lolos.
+  { re: /\bgit\s+(checkout|restore)\b(?=[^;&|]*--\s|[^;&|]*\.\w)/ },
+  { re: /\bcurl\b/ }, // curl -o <path> — URL tidak akan overlap path lokal
+  { re: /\bwget\b/ }, // wget -O <path>
+  { re: /\brsync\b/, lastOnly: true }, // rsync <src...> <dest>
+  { re: /\bln\s+/ }, // ln -sf <src> <dest>: menimpa dest juga dihitung
 ];
+
+/**
+ * Perintah yang target tulisnya tidak bisa ditentukan dari string command
+ * (isi archive, isi diff, pola -delete). Diblokir konservatif bila ada klaim
+ * milik sesi lain yang aktif — worker dipersilakan pakai write/edit.
+ */
+const OPAQUE_VERBS: { re: RegExp; label: string }[] = [
+  { re: /\bpatch\b/, label: "patch" },
+  { re: /\bgit\s+apply\b/, label: "git apply" },
+  { re: /\btar\s+[^;&|]*\bx/i, label: "tar -x (extract)" },
+  { re: /\bunzip\b(?![^;&|]*\s-l\b)/, label: "unzip" },
+  { re: /\bfind\b(?=[^;&|]*-delete)/, label: "find -delete" },
+];
+
+/** xargs + verb destruktif, mis. `... | xargs rm -f`. */
+const XARGS_DESTRUCTIVE = /\bxargs\b[^|]*\b(rm|mv|unlink|shred|tee)\b/;
+
+/** Interpreter inline, mis. `python -c "..."`, `node -e "..."`. */
+const INTERP_RUN = /\b(python3?|node|ruby|php|perl)\b[^;&|]*?\s-[cer]\b/;
+const INTERP_WRITE_KW = /\bopen\s*\(|writeFile|write_text|file_put_contents|\bos\.(remove|unlink)|shutil|\bunlink\s*\(|\bfopen\s*\(/;
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -293,6 +395,10 @@ function redirectTargetsClaim(cmd: string, claimPath: string, cwd?: string): boo
 /**
  * Guard heuristic untuk tool `bash`. Blokir bila command mencoba
  * menulis/menghapus path yang diklaim sesi lain.
+ *
+ * Bukan parsing shell yang sempurna: menutup bypass yang tidak disengaja
+ * dan pola umum, bukan adversary yang berniat mengakali (path ter-obfuscate
+ * di dalam python -c, dsb. — untuk itu tetap andalkan disiplin worker).
  */
 export function guardBashWrite(
   command: string,
@@ -303,16 +409,77 @@ export function guardBashWrite(
   if (!command || !sessionID) return {};
   const others = reg.list().filter((c) => c.sessionID !== sessionID);
   if (others.length === 0) return {};
-  for (const c of others) {
-    if (redirectTargetsClaim(command, c.path, cwd) || verbTargetsClaim(command, c.path, cwd)) {
-      const shown = cwd ? rel(cwd, c.path) : c.path;
+  const shown = (p: string) => (cwd ? rel(cwd, p) : p);
+  const owners = others.map((o) => `"${o.owner}"`).join(", ");
+
+  // 1. Perintah opaque (target tulis tak bisa ditentukan statis) → blokir konservatif.
+  for (const { re, label } of OPAQUE_VERBS) {
+    if (re.test(command)) {
       return {
         blocked:
-          `⛔ Orkestra: perintah shell ini mencoba menulis/menghapus "${shown}" ` +
+          `⛔ Orkestra: "${label}" berpotensi menulis banyak file sekaligus sementara ` +
+          `ada klaim aktif milik tugas lain (${owners}). ` +
+          `Pastikan tidak menimpa file mereka, atau lakukan via tool write/edit.`,
+      };
+    }
+  }
+
+  for (const c of others) {
+    // 2. xargs destruktif: cek apakah path klaim disebut di segmen pipa sebelumnya.
+    if (XARGS_DESTRUCTIVE.test(command)) {
+      const before = command.slice(0, command.search(/\bxargs\b/));
+      if (mentionsClaim(before, c.path, cwd)) {
+        return {
+          blocked:
+            `⛔ Orkestra: perintah xargs ini menarget "${shown(c.path)}" ` +
+            `yang diklaim oleh tugas "${c.owner}" (sesi lain).`,
+        };
+      }
+      // Path tidak terlihat di teks (mis. dari find) → tetap blokir konservatif.
+      return {
+        blocked:
+          `⛔ Orkestra: xargs destruktif sementara ada klaim aktif milik tugas lain (${owners}). ` +
+          `Pastikan tidak menimpa file mereka, atau lakukan via tool write/edit.`,
+      };
+    }
+
+    // 3. Interpreter inline: path klaim + keyword operasi tulis di dalam skrip.
+    if (interpTargetsClaim(command, c.path, cwd)) {
+      return {
+        blocked:
+          `⛔ Orkestra: skrip inline ini menulis ke "${shown(c.path)}" ` +
+          `yang diklaim oleh tugas "${c.owner}" (sesi lain). ` +
+          `Tulis file hanya via tool write/edit.`,
+      };
+    }
+
+    // 4. Verb mutasi + redirect dengan target path yang jelas.
+    if (redirectTargetsClaim(command, c.path, cwd) || verbTargetsClaim(command, c.path, cwd)) {
+      return {
+        blocked:
+          `⛔ Orkestra: perintah shell ini mencoba menulis/menghapus "${shown(c.path)}" ` +
           `yang diklaim oleh tugas "${c.owner}" (sesi lain). ` +
           `Tulis file hanya via tool write/edit, atau minta mandor realokasi via orkestra_release.`,
       };
     }
   }
   return {};
+}
+
+/** true bila teks menyebut path klaim (absolut atau relatif thd cwd). */
+function mentionsClaim(text: string, claimPath: string, cwd?: string): boolean {
+  if (text.includes(claimPath)) return true;
+  if (cwd) {
+    const r = relative(cwd, claimPath);
+    if (r && !r.startsWith("..") && !isAbsolute(r) && text.includes(r)) return true;
+  }
+  return false;
+}
+
+/** true bila skrip inline interpreter menyebut path klaim + keyword operasi tulis. */
+function interpTargetsClaim(cmd: string, claimPath: string, cwd?: string): boolean {
+  const m = INTERP_RUN.exec(cmd);
+  if (!m) return false;
+  const script = cmd.slice(m.index + m[0].length);
+  return mentionsClaim(script, claimPath, cwd) && INTERP_WRITE_KW.test(script);
 }
