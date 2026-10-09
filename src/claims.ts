@@ -24,7 +24,7 @@ export interface Claim {
 }
 
 /** Tool bawaan opencode yang menulis ke file. */
-const WRITE_TOOLS = new Set(["write", "edit", "patch"]);
+const WRITE_TOOLS = new Set(["write", "edit", "patch", "apply_patch"]);
 
 export function isWriteTool(toolName: string): boolean {
   return WRITE_TOOLS.has(toolName);
@@ -32,10 +32,35 @@ export function isWriteTool(toolName: string): boolean {
 
 /** Ambil path target dari argumen tool tulis. null bila bukan tool tulis / tidak ada path. */
 export function extractWritePath(toolName: string, args: unknown): string | null {
-  if (!isWriteTool(toolName)) return null;
+  const all = extractWritePaths(toolName, args);
+  return all.length > 0 ? all[0] : null;
+}
+
+/**
+ * Semua path target dari argumen tool tulis. `apply_patch` (format patch
+ * ala OpenAI: `*** Update File: <path>`) bisa menyentuh banyak file sekaligus.
+ */
+export function extractWritePaths(toolName: string, args: unknown): string[] {
+  if (!isWriteTool(toolName)) return [];
+  if (toolName === "apply_patch") {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const pt = a["patchText"];
+    return typeof pt === "string" ? extractPatchPaths(pt) : [];
+  }
   const a = (args ?? {}) as Record<string, unknown>;
   const p = a["filePath"] ?? a["path"] ?? a["file"];
-  return typeof p === "string" && p.length > 0 ? p : null;
+  return typeof p === "string" && p.length > 0 ? [p] : [];
+}
+
+/** Ambil path file dari teks patch ala OpenAI (`*** Update/Add/Delete File: <path>`). */
+export function extractPatchPaths(patchText: string): string[] {
+  const out: string[] = [];
+  const re = /^\*\*\*\s+(?:Update File|Add File|Delete File):\s*(.+?)\s*$/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(patchText))) {
+    if (m[1].length > 0) out.push(m[1]);
+  }
+  return out;
 }
 
 function norm(p: string): string {
@@ -297,19 +322,24 @@ export function guardWrite(
   reg: ClaimRegistry,
   cwd?: string,
 ): GuardVerdict {
-  const raw = extractWritePath(toolName, args);
-  if (!raw || !sessionID) return {};
-  // Path relatif tanpa cwd yang jelas = tidak bisa diverifikasi → fail-open.
-  if (!isAbsolute(raw) && !cwd) return {};
-  const abs = norm(isAbsolute(raw) ? raw : resolve(cwd as string, raw));
-  const hit = reg.check(abs, sessionID);
-  if (!hit) return {};
-  return {
-    blocked:
-      `⛔ Orkestra: "${raw}" diklaim oleh tugas "${hit.owner}" ` +
-      `(sesi lain). Satu file hanya boleh ditulis satu tugas dalam satu waktu. ` +
-      `Pilih file lain, atau minta mandor mengalokasikan ulang via orkestra_release.`,
-  };
+  if (!sessionID) return {};
+  const raws = extractWritePaths(toolName, args);
+  if (raws.length === 0) return {};
+  for (const raw of raws) {
+    // Path relatif tanpa cwd yang jelas = tidak bisa diverifikasi → fail-open.
+    if (!isAbsolute(raw) && !cwd) continue;
+    const abs = norm(isAbsolute(raw) ? raw : resolve(cwd as string, raw));
+    const hit = reg.check(abs, sessionID);
+    if (hit) {
+      return {
+        blocked:
+          `⛔ Orkestra: "${raw}" diklaim oleh tugas "${hit.owner}" ` +
+          `(sesi lain). Satu file hanya boleh ditulis satu tugas dalam satu waktu. ` +
+          `Pilih file lain, atau minta mandor mengalokasikan ulang via orkestra_release.`,
+      };
+    }
+  }
+  return {};
 }
 
 // ---------------------------------------------------------------------------

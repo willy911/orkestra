@@ -13,10 +13,12 @@
  * - Klaim kedaluwarsa otomatis (TTL 6 jam) agar tidak menggantung bila crash.
  */
 import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin as PluginV2 } from "@opencode/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolve } from "node:path";
 import { ClaimRegistry, DEFAULT_CLAIM_TTL_MS, guardBashWrite, guardWrite, isWriteTool, rel } from "./claims.js";
 import { PERINTAH_ORKESTRA, PROMPT_MANDOR, PROMPT_TUKANG } from "./prompts.gen.js";
+import { ORKESTRA_PLUGIN_ID, setupV2 } from "./v2.js";
 
 const ORKESTRA_DIRNAME = "orkestra";
 
@@ -165,3 +167,19 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
     },
   };
 };
+
+/**
+ * Entrypoint ganda V1 + V2 dalam satu bundle:
+ * - opencode V2 memanggil `setup(ctx)` (API `@opencode/plugin`).
+ * - opencode V1 (>= 1.18.29) memanggil `server(input)`; V1 lama memakai
+ *   named export `OrkestraPlugin` seperti sebelumnya.
+ */
+const orkestraDefinition = {
+  id: ORKESTRA_PLUGIN_ID,
+  setup: setupV2,
+  async server(input: unknown) {
+    return OrkestraPlugin(input as never);
+  },
+} satisfies PluginV2.Plugin & { server: (input: unknown) => Promise<unknown> };
+
+export default orkestraDefinition;

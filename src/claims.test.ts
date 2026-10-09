@@ -9,6 +9,7 @@ import { join, normalize } from "node:path";
 import {
   ClaimRegistry,
   DEFAULT_CLAIM_TTL_MS,
+  extractPatchPaths,
   extractWritePath,
   guardBashWrite,
   guardWrite,
@@ -880,5 +881,50 @@ describe("index.ts v0.1.4 — konsistensi worktree/directory", () => {
     // A melepas klaimnya sendiri via path relatif → harus berhasil (sebelum fix: 0, menggantung)
     const released = await tools.orkestra_release.execute({ target: "src/a.ts" }, tctxA as never);
     expect(String(released)).toContain("1 klaim");
+  });
+});
+
+describe("claims v0.2.0 — apply_patch (tool tulis utama opencode v2)", () => {
+  test("extractPatchPaths membaca format patch ala OpenAI", () => {
+    const pt = [
+      "*** Begin Patch",
+      "*** Update File: src/a.ts",
+      "@@ -1,2 +1,2 @@",
+      "-x",
+      "+y",
+      "*** Add File: src/b.ts",
+      "+baru",
+      "*** Delete File: src/c.ts",
+      "*** End Patch",
+    ].join("\n");
+    expect(extractPatchPaths(pt)).toEqual(["src/a.ts", "src/b.ts", "src/c.ts"]);
+    expect(extractPatchPaths("tidak ada patch")).toEqual([]);
+  });
+
+  test("guardWrite memblokir apply_patch yang menyentuh file klaim", () => {
+    const { reg, dir, cleanup } = freshRegistry();
+    try {
+      reg.claim(["src/a.ts"], "tugas-1", A, dir);
+      const pt = "*** Begin Patch\n*** Update File: src/a.ts\n@@\n*** End Patch";
+      const v = guardWrite("apply_patch", { patchText: pt }, B, reg, dir);
+      expect(v.blocked).toContain("tugas-1");
+      const pt2 = "*** Begin Patch\n*** Update File: src/lain.ts\n@@\n*** End Patch";
+      expect(guardWrite("apply_patch", { patchText: pt2 }, B, reg, dir).blocked).toBeUndefined();
+      // pemilik klaim tetap boleh
+      expect(guardWrite("apply_patch", { patchText: pt }, A, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("apply_patch multi-file: satu saja kena klaim = DIBLOKIR", () => {
+    const { reg, dir, cleanup } = freshRegistry();
+    try {
+      reg.claim(["src/b.ts"], "tugas-1", A, dir);
+      const pt = "*** Begin Patch\n*** Update File: src/a.ts\n@@\n*** Update File: src/b.ts\n@@\n*** End Patch";
+      expect(guardWrite("apply_patch", { patchText: pt }, B, reg, dir).blocked).toContain("tugas-1");
+    } finally {
+      cleanup();
+    }
   });
 });
