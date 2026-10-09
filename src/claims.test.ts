@@ -663,3 +663,143 @@ describe("lockfile antar proses", () => {
     }
   });
 });
+
+describe("guardBashWrite v0.1.3 — opaque hanya di posisi command", () => {
+  function r3() {
+    const { reg, dir, cleanup } = freshRegistry();
+    reg.claim(["src/a.ts"], "tugas-1", A, dir);
+    return { reg, dir, cleanup };
+  }
+
+  test("kata patch/unzip di argumen TIDAK diblokir", () => {
+    const { reg, dir, cleanup } = r3();
+    try {
+      for (const cmd of [
+        `grep -rn "patch" src/`,
+        `rg "patch" -t ts`,
+        `git commit -m "patch: fix login"`,
+        `git log --grep=patch`,
+        `bun test --grep patch`,
+        `echo "unzip the file"`,
+        `echo "git apply patch-nya"`,
+      ]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toBeUndefined();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("patch/git apply sebagai command TETAP diblokir (termasuk sudo & subshell)", () => {
+    const { reg, dir, cleanup } = r3();
+    try {
+      for (const cmd of [
+        `patch -p1 < /tmp/p.diff`,
+        `echo mulai; patch -p1 < /tmp/p.diff`,
+        `sudo patch -p1 < /tmp/p.diff`,
+        `git apply /tmp/p.diff`,
+      ]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toBeDefined();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("tar/unzip/find: extract diblokir, list/baca lolos", () => {
+    const { reg, dir, cleanup } = r3();
+    try {
+      expect(guardBashWrite(`tar -xzf a.tgz`, B, reg, dir).blocked).toBeDefined();
+      expect(guardBashWrite(`tar xzf a.tgz`, B, reg, dir).blocked).toBeDefined();
+      expect(guardBashWrite(`tar -tzf a.tgz`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`tar -czf x.tgz dir/`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`unzip -o a.zip`, B, reg, dir).blocked).toBeDefined();
+      expect(guardBashWrite(`unzip -l a.zip`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`find src -name '*.tmp' -delete`, B, reg, dir).blocked).toBeDefined();
+      expect(guardBashWrite(`find src -name '*.ts'`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("git plumbing destruktif diblokir bila ada klaim asing", () => {
+    const { reg, dir, cleanup } = r3();
+    try {
+      for (const cmd of [`git stash pop`, `git stash apply`, `git reset --hard`, `git clean -fdx`]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toBeDefined();
+      }
+      expect(guardBashWrite(`git stash list`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`git clean -ndx`, B, reg, dir).blocked).toBeUndefined(); // dry-run
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("guardBashWrite v0.1.3 — dd of=, touch/chmod/perl, git checkout .", () => {
+  function r4() {
+    const { reg, dir, cleanup } = freshRegistry();
+    reg.claim(["src/a.ts"], "tugas-1", A, dir);
+    return { reg, dir, cleanup };
+  }
+  const P = (dir: string, p: string) => join(dir, p);
+
+  test("dd of= ke file klaim = DIBLOKIR (urutan argumen apa pun)", () => {
+    const { reg, dir, cleanup } = r4();
+    try {
+      expect(guardBashWrite(`dd if=/dev/zero of=${P(dir, "src/a.ts")} bs=1M count=1`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`dd of=${P(dir, "src/a.ts")} if=/dev/zero`, B, reg, dir).blocked).toContain("tugas-1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("dd if= dari file klaim (baca) = LOLOS", () => {
+    const { reg, dir, cleanup } = r4();
+    try {
+      expect(guardBashWrite(`dd if=${P(dir, "src/a.ts")} of=/tmp/out`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("touch/chmod/perl -i ke file klaim = DIBLOKIR", () => {
+    const { reg, dir, cleanup } = r4();
+    try {
+      expect(guardBashWrite(`touch ${P(dir, "src/a.ts")}`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`chmod 644 ${P(dir, "src/a.ts")}`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`perl -i -pe 's/x/y/' ${P(dir, "src/a.ts")}`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`touch /tmp/bebas.ts`, B, reg, dir).blocked).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("git checkout . (bare dot) = DIBLOKIR; checkout branch tetap lolos", () => {
+    const { reg, dir, cleanup } = r4();
+    try {
+      expect(guardBashWrite(`git checkout .`, B, reg, dir).blocked).toBeDefined();
+      expect(guardBashWrite(`git checkout main`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`git restore --staged .`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`git restore --staged --worktree ${P(dir, "src/a.ts")}`, B, reg, dir).blocked).toBeDefined();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("lockfile v0.1.3 — ownership & retry", () => {
+  test("releaseLock tidak menghapus lock milik proses lain", () => {
+    const dir = mkdtempSync(join(tmpdir(), "orkestra-test-"));
+    try {
+      const persist = join(dir, "claims.json");
+      writeFileSync(persist + ".lock", `99999:${Date.now()}`); // lock asing yang masih segar
+      const reg = new ClaimRegistry(persist);
+      const r = reg.claim(["src/a.ts"], "t1", A, dir); // retry 3x → best-effort tanpa lock
+      expect(r.ok).toBe(true);
+      expect(existsSync(persist + ".lock")).toBe(true); // lock asing tetap ada
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -10,8 +10,12 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(dirname(new URL(import.meta.url).pathname), "..");
+// fileURLToPath (bukan new URL(...).pathname): pathname meng-encode spasi jadi
+// %20 dan di Windows menghasilkan /C:/... yang lalu ditempeli drive lagi
+// oleh resolve() → C:\C:\... (ENOENT deterministik).
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const promptDir = resolve(root, "prompt");
 const srcDir = resolve(root, "src");
 const distDir = resolve(root, "dist");

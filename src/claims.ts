@@ -208,26 +208,38 @@ export class ClaimRegistry {
    * Lock basi (>5 detik, mis. proses crash) otomatis dicuri.
    */
   private mutate<T>(fn: () => T): T {
-    if (!this.acquireLock()) return fn(); // best-effort tanpa lock
-    try {
-      this.refresh();
-      return fn();
-    } finally {
-      this.releaseLock();
+    // Coba dapatkan lock beberapa kali dengan backoff; hanya sebagai
+    // best-effort terakhir jalan tanpa lock (jendela Lost Update residual).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (this.acquireLock()) {
+        try {
+          this.refresh();
+          return fn();
+        } finally {
+          this.releaseLock();
+        }
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (attempt + 1));
     }
+    this.refresh();
+    return fn();
   }
 
   private lockPath(): string {
     return `${this.persistPath}.lock`;
   }
 
+  private lockToken: string | null = null;
+
   private acquireLock(): boolean {
     if (!this.persistPath) return true;
     const lp = this.lockPath();
     try {
+      const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
       const fd = openSync(lp, "wx"); // O_CREAT|O_EXCL: gagal bila sudah ada
-      writeSync(fd, `${process.pid}:${Date.now()}`);
+      writeSync(fd, token);
       closeSync(fd);
+      this.lockToken = token;
       return true;
     } catch {
       try {
@@ -237,19 +249,23 @@ export class ClaimRegistry {
           return this.acquireLock();
         }
       } catch {
-        /* abaikan, jalan tanpa lock */
+        /* abaikan, coba lagi di attempt berikutnya */
       }
       return false;
     }
   }
 
   private releaseLock(): void {
-    if (!this.persistPath) return;
+    if (!this.persistPath || !this.lockToken) return;
     try {
-      rmSync(this.lockPath(), { force: true });
+      // Hanya hapus bila isinya masih token milik kita (bisa dicuri proses lain).
+      if (readFileSync(this.lockPath(), "utf8") === this.lockToken) {
+        rmSync(this.lockPath(), { force: true });
+      }
     } catch {
       /* abaikan */
     }
+    this.lockToken = null;
   }
 
   private save(): void {
@@ -310,6 +326,8 @@ interface BashVerb {
   re: RegExp;
   /** true = hanya token path TERAKHIR yang dicek (cp/install/rsync: destinasinya) */
   lastOnly?: boolean;
+  /** bila cocok pada segmen → verb ini diabaikan (mis. --staged tanpa --worktree) */
+  skipIf?: RegExp;
 }
 
 const BASH_VERBS: BashVerb[] = [
@@ -320,10 +338,16 @@ const BASH_VERBS: BashVerb[] = [
   { re: /\btee\s+(-a\s+)?/ }, // tee menulis ke semua argumen
   { re: /\binstall\s+/, lastOnly: true }, // install: hanya destinasi
   { re: /\btruncate\s+(-s\s+\S+\s+)?/ },
+  { re: /\btouch\b/ }, // touch: mengubah metadata file
+  { re: /\bchmod\b/ }, // chmod: mengubah permission file
+  { re: /\bperl\s+(?=[^;&|]*-i)/ }, // perl -i -pe ... (in-place, seperti sed -i)
   { re: /\bdd\s+(?=[^;&|]*\bof=)/ },
-  // git checkout/restore: dengan `--`, atau path ber-ekstensi (tanpa --).
-  // `git checkout main`, `git checkout -b x`, `git restore --staged` lolos.
-  { re: /\bgit\s+(checkout|restore)\b(?=[^;&|]*--\s|[^;&|]*\.\w)/ },
+  // git checkout/restore: dengan `--`, atau path ber-ekstensi / bare `.` (tanpa --).
+  // `git checkout main`, `git checkout -b x`, `git restore --staged` (tanpa --worktree) lolos.
+  {
+    re: /\bgit\s+(checkout|restore)\b(?=[^;&|]*--\s|[^;&|]*\.(?:\w|$|\s))/,
+    skipIf: /--staged\b(?![^;&|]*--worktree)/,
+  },
   { re: /\bcurl\b/ }, // curl -o <path> — URL tidak akan overlap path lokal
   { re: /\bwget\b/ }, // wget -O <path>
   { re: /\brsync\b/, lastOnly: true }, // rsync <src...> <dest>
@@ -331,17 +355,55 @@ const BASH_VERBS: BashVerb[] = [
 ];
 
 /**
- * Perintah yang target tulisnya tidak bisa ditentukan dari string command
- * (isi archive, isi diff, pola -delete). Diblokir konservatif bila ada klaim
- * milik sesi lain yang aktif — worker dipersilakan pakai write/edit.
+ * Pecah command menjadi segmen perintah. Daerah ber-quote dihapus dulu agar
+ * `grep "patch"` / `git commit -m "patch: x"` tidak terbaca sebagai command.
  */
-const OPAQUE_VERBS: { re: RegExp; label: string }[] = [
-  { re: /\bpatch\b/, label: "patch" },
-  { re: /\bgit\s+apply\b/, label: "git apply" },
-  { re: /\btar\s+[^;&|]*\bx/i, label: "tar -x (extract)" },
-  { re: /\bunzip\b(?![^;&|]*\s-l\b)/, label: "unzip" },
-  { re: /\bfind\b(?=[^;&|]*-delete)/, label: "find -delete" },
-];
+function commandSegments(cmd: string): { head: string; tokens: string[]; text: string }[] {
+  const dequoted = cmd.replace(/(["'])(?:(?!\1|\\).|\\.)*\1/g, "");
+  return dequoted
+    .split(/[;&|\n()]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map((text) => {
+      const tokens = text.split(/\s+/).filter((t) => t.length > 0);
+      let head = (tokens[0] || "").toLowerCase();
+      let rest = tokens.slice(1);
+      if (head === "sudo" && rest.length > 0) {
+        head = (rest[0] || "").toLowerCase();
+        rest = rest.slice(1);
+      }
+      return { head, tokens: rest, text };
+    });
+}
+
+/**
+ * Perintah yang target tulisnya tidak bisa ditentukan dari string command
+ * (isi archive, isi diff, pola -delete, git plumbing destruktif). Hanya
+ * dikenali bila muncul di posisi command (head segmen) — bukan substring
+ * di argumen seperti `grep "patch"`. Diblokir konservatif bila ada klaim
+ * milik sesi lain.
+ */
+function opaqueHit(cmd: string): string | null {
+  for (const { head, tokens, text } of commandSegments(cmd)) {
+    if (head === "patch") return "patch";
+    if (head === "git") {
+      const sub = (tokens[0] || "").toLowerCase();
+      if (sub === "apply") return "git apply";
+      if (sub === "clean" && /-[a-z]*f/.test(tokens[1] || "")) return "git clean -f";
+      if (sub === "stash" && ["pop", "apply"].includes((tokens[1] || "").toLowerCase())) {
+        return "git stash pop/apply";
+      }
+      if (sub === "reset" && tokens.includes("--hard")) return "git reset --hard";
+    }
+    if (head === "tar") {
+      const flags = tokens[0] || "";
+      if (/^--extract\b/.test(flags) || /^-?[a-zA-Z]*x/.test(flags)) return "tar -x (extract)";
+    }
+    if (head === "unzip" && !/\s-l\b/.test(text)) return "unzip";
+    if (head === "find" && /-delete\b/.test(text)) return "find -delete";
+  }
+  return null;
+}
 
 /** xargs + verb destruktif, mis. `... | xargs rm -f`. */
 const XARGS_DESTRUCTIVE = /\bxargs\b[^|]*\b(rm|mv|unlink|shred|tee)\b/;
@@ -364,17 +426,19 @@ function shellTokens(seg: string): string[] {
 
 /** true bila token path (absolut/relatif thd cwd) bersinggungan dengan klaim. */
 function tokenHitsClaim(tok: string, claimPath: string, cwd?: string): boolean {
-  if (!isAbsolute(tok) && !cwd) return false;
-  const abs = norm(isAbsolute(tok) ? tok : resolve(cwd as string, tok));
+  const t = tok.replace(/^of=/, ""); // dd of=<path>
+  if (!isAbsolute(t) && !cwd) return false;
+  const abs = norm(isAbsolute(t) ? t : resolve(cwd as string, t));
   return overlaps(abs, claimPath);
 }
 
 /** Cek verb mutasi: apakah ada token targetnya yang mengenai klaim? */
 function verbTargetsClaim(cmd: string, claimPath: string, cwd?: string): boolean {
-  for (const { re, lastOnly } of BASH_VERBS) {
+  for (const { re, lastOnly, skipIf } of BASH_VERBS) {
     const m = re.exec(cmd);
     if (!m) continue;
     const seg = cmd.slice(m.index + m[0].length, m.index + m[0].length + 300).split(/[;&|]/)[0];
+    if (skipIf && skipIf.test(seg)) continue;
     let toks = shellTokens(seg);
     if (lastOnly) toks = toks.slice(-1);
     if (toks.some((t) => tokenHitsClaim(t, claimPath, cwd))) return true;
@@ -413,15 +477,15 @@ export function guardBashWrite(
   const owners = others.map((o) => `"${o.owner}"`).join(", ");
 
   // 1. Perintah opaque (target tulis tak bisa ditentukan statis) → blokir konservatif.
-  for (const { re, label } of OPAQUE_VERBS) {
-    if (re.test(command)) {
-      return {
-        blocked:
-          `⛔ Orkestra: "${label}" berpotensi menulis banyak file sekaligus sementara ` +
-          `ada klaim aktif milik tugas lain (${owners}). ` +
-          `Pastikan tidak menimpa file mereka, atau lakukan via tool write/edit.`,
-      };
-    }
+  // Hanya bila muncul di posisi command, bukan substring di argumen.
+  const opaque = opaqueHit(command);
+  if (opaque) {
+    return {
+      blocked:
+        `⛔ Orkestra: "${opaque}" berpotensi menulis banyak file sekaligus sementara ` +
+        `ada klaim aktif milik tugas lain (${owners}). ` +
+        `Pastikan tidak menimpa file mereka, atau lakukan via tool write/edit.`,
+    };
   }
 
   for (const c of others) {
