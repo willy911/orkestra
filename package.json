@@ -18,8 +18,8 @@
     "build": "bun scripts/build.ts",
     "prepublishOnly": "bun run build",
     "test": "bun test",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit"
   },
   "type": "module",
-  "version": "0.1.1"
+  "version": "0.1.2"
 }

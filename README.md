@@ -126,16 +126,16 @@ Prompt di `prompt/*.md` adalah sumber kebenaran — `bun run build` meng-embed-n
 ```bash
 bun install        # install dependensi
 bun run build      # generate prompts + bundle dist/orkestra.js
-bun test           # 40 unit test (claim registry, guard write/bash, TTL, refresh, edge cases)
+bun test           # 51 unit test (claim registry, guard write/bash, TTL, lockfile, edge cases)
 bun run typecheck  # tsc --noEmit
 ```
 
-Terverifikasi: 40 test lolos, `tsc` bersih, dan bundle ter-load di opencode 1.18.35 asli (agen `mandor`/`tukang` + command `/orkestra` terdaftar via API, alur claim → blokir → release → auto-release sesi mati teruji end-to-end).
+Terverifikasi: 51 test lolos, `tsc` bersih, dan bundle ter-load di opencode 1.18.35 asli (agen `mandor`/`tukang` + command `/orkestra` terdaftar via API, alur claim → blokir → release → auto-release sesi mati teruji end-to-end).
 
 ## Catatan
 
-- Klaim disimpan di `<proyek>/.opencode/orkestra/claims.json` (persist antar restart; ditulis atomik, di-reload tiap operasi agar dua proses opencode tidak saling menimpa).
-- Klaim kedaluwarsa otomatis setelah 6 jam (mencegah klaim menggantung bila opencode crash); umurnya tampil di `orkestra_status`.
+- Klaim disimpan di `<proyek>/.opencode/orkestra/claims.json` (persist antar restart; ditulis atomik, di-reload tiap operasi, dan dimutasi di dalam lockfile agar dua proses opencode tidak saling menimpa).
+- Klaim kedaluwarsa otomatis setelah 6 jam; sesi yang masih aktif menulis otomatis memperpanjang (sliding TTL) sehingga tidak kehilangan klaim di tengah sesi panjang. Umur tampil di `orkestra_status`.
 - Jika worker mati tanpa melepas klaim, mandor bisa melepas paksa: `orkestra_release` dengan `force: true`.
-- Perintah shell juga diawasi (heuristic): `sed -i`, redirect `>`, `rm`, `mv`, `tee`, `git checkout --`, dsb. yang menarget file klaim akan ditolak. Ini bukan parsing shell yang sempurna — tetap tulis file via tool write/edit. Operasi baca (`grep`/`cat`) tidak tersentuh.
+- Perintah shell juga diawasi (heuristic): `sed -i`, redirect `>`, `rm`/`mv`/`ln`, `tee`, `curl -o`/`wget -O`, `rsync`, `git checkout`/`git restore`, `git apply`, `patch`, `tar -x`/`unzip`, `find -delete`, `xargs` destruktif, dan skrip inline (`python -c`/`node -e`) yang menulis path klaim akan ditolak. Operasi baca (`grep`/`cat`) tidak tersentuh. Ini bukan parsing shell yang sempurna — tetap tulis file via tool write/edit.
 - Guard bersifat fail-open untuk path relatif yang tidak bisa di-resolve — tukang diinstruksikan memakai path absolut.
