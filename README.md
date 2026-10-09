@@ -50,6 +50,8 @@ Aturannya juga menangkap kasus tidak langsung: mengklaim direktori `src/auth` me
 | `orkestra_release` | tool | Lepas klaim setelah selesai |
 | `orkestra_status` | tool | Lihat siapa memegang file apa |
 
+Mendukung **opencode V1** (≥ 1.18.29) dan **opencode V2** dalam satu bundle yang sama — host otomatis memakai adaptor yang sesuai. Di V2, agen `mandor`/`tukang` dan command `/orkestra` disediakan sebagai file definisi di `~/.config/opencode/agents/` dan `~/.config/opencode/commands/` (ditulis otomatis saat plugin pertama dimuat; definisi milikmu tidak akan ditimpa).
+
 ## Instalasi
 
 ### Opsi A — via npm (paling gampang, direkomendasikan)
@@ -57,10 +59,11 @@ Aturannya juga menangkap kasus tidak langsung: mengklaim direktori `src/auth` me
 Tambahkan ke `opencode.json` (global di `~/.config/opencode/opencode.json`, atau per proyek):
 
 ```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-orkestra"]
-}
+// opencode V1:
+{ "$schema": "https://opencode.ai/config.json", "plugin": ["opencode-orkestra"] }
+
+// opencode V2:
+{ "$schema": "https://opencode.ai/config.json", "plugins": ["opencode-orkestra"] }
 ```
 
 opencode menginstall otomatis via bun saat startup. Restart opencode, selesai.
@@ -76,7 +79,7 @@ bun install && bun run build
 Lalu copy hasilnya ke folder plugin opencode:
 
 - Global (semua proyek): `~/.config/opencode/plugins/orkestra.js` ← dari `dist/orkestra.js`
-- Per proyek: `<proyek>/.opencode/plugins/orkestra.js`
+- Per proyek: `<proyek>/.opencode/plugins/orkestra.js` (di V2 folder ini dibaca otomatis)
 
 Restart opencode. Selesai.
 
@@ -126,11 +129,11 @@ Prompt di `prompt/*.md` adalah sumber kebenaran — `bun run build` meng-embed-n
 ```bash
 bun install        # install dependensi
 bun run build      # generate prompts + bundle dist/orkestra.js
-bun test           # 64 unit test (claim registry, guard write/bash, TTL, lockfile, worktree/directory, edge cases)
+bun test           # 70 unit test (claim registry, guard write/bash, TTL, lockfile, worktree/directory, apply_patch, v2 wiring, edge cases)
 bun run typecheck  # tsc --noEmit
 ```
 
-Terverifikasi: 64 test lolos, `tsc` bersih, dan bundle ter-load di opencode 1.18.35 asli (agen `mandor`/`tukang` + command `/orkestra` terdaftar via API, alur claim → blokir → release → auto-release sesi mati teruji end-to-end).
+Terverifikasi: 70 test lolos, `tsc` bersih. Ter-load di opencode **V1** 1.18.35 (agen `mandor`/`tukang` + command `/orkestra` terdaftar via API, alur claim → blokir → release → auto-release sesi mati teruji end-to-end) dan **V2** 2.0.26 (plugin `active`, agen + command terdaftar via API, tools + guard + auto-release teruji via harness).
 
 ## Catatan
 
@@ -138,5 +141,5 @@ Terverifikasi: 64 test lolos, `tsc` bersih, dan bundle ter-load di opencode 1.18
 - Klaim disimpan di `<proyek>/.opencode/orkestra/claims.json` (persist antar restart; ditulis atomik, di-reload tiap operasi, dan dimutasi di dalam lockfile O_EXCL agar dua proses opencode tidak saling menimpa — lock basi >5 detik otomatis dicuri, lock asing tidak pernah dihapus).
 - Klaim kedaluwarsa otomatis setelah 6 jam; sesi yang masih aktif menulis otomatis memperpanjang (sliding TTL) sehingga tidak kehilangan klaim di tengah sesi panjang. Umur tampil di `orkestra_status`.
 - Jika worker mati tanpa melepas klaim, mandor bisa melepas paksa: `orkestra_release` dengan `force: true`.
-- Perintah shell juga diawasi (heuristic, hanya bila keyword di posisi command — `grep "patch"` tidak diblokir): `sed -i`/`perl -i`, redirect `>`, `rm`/`mv`/`ln`/`touch`/`chmod`, `tee`, `curl -o`/`wget -O`, `rsync`, `dd of=`, `git checkout`/`git restore`/`git stash pop`/`git reset --hard`/`git clean -f`, `git apply`, `patch`, `tar -x`/`unzip`, `find -delete`, `xargs` destruktif, dan skrip inline (`python -c`/`node -e`) yang menulis path klaim akan ditolak. Operasi baca (`grep`/`cat`) tidak tersentuh. Verb shell hanya dikenali di luar daerah ber-quote (`grep -rn "touch"` lolos, `rm "/klaim/a.ts"` tetap diblokir). Ini bukan parsing shell yang sempurna — tetap tulis file via tool write/edit.
+- Perintah shell juga diawasi (heuristic, hanya bila keyword di posisi command — `grep "patch"` tidak diblokir): `sed -i`/`perl -i`, redirect `>`, `rm`/`mv`/`ln`/`touch`/`chmod`, `tee`, `curl -o`/`wget -O`, `rsync`, `dd of=`, `git checkout`/`git restore`/`git stash pop`/`git reset --hard`/`git clean -f`, `git apply`, `patch`, `tar -x`/`unzip`, `find -delete`, `xargs` destruktif, dan skrip inline (`python -c`/`node -e`) yang menulis path klaim akan ditolak. Tool `apply_patch` (dipakai model-model baru di opencode V2 sebagai pengganti edit/write) juga dijaga: path di dalam `patchText` diekstrak dan dicek satu per satu. Operasi baca (`grep`/`cat`) tidak tersentuh. Verb shell hanya dikenali di luar daerah ber-quote (`grep -rn "touch"` lolos, `rm "/klaim/a.ts"` tetap diblokir). Ini bukan parsing shell yang sempurna — tetap tulis file via tool write/edit.
 - Guard bersifat fail-open untuk path relatif yang tidak bisa di-resolve — tukang diinstruksikan memakai path absolut.
