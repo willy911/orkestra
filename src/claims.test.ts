@@ -803,3 +803,82 @@ describe("lockfile v0.1.3 — ownership & retry", () => {
     }
   });
 });
+
+describe("guardBashWrite v0.1.4 — verb tidak match di dalam quote", () => {
+  function r5() {
+    const { reg, dir, cleanup } = freshRegistry();
+    reg.claim(["src/a.ts"], "tugas-1", A, dir);
+    return { reg, dir, cleanup };
+  }
+
+  test("grep/echo/commit yang menyebut touch/chmod di quote = LOLOS", () => {
+    const { reg, dir, cleanup } = r5();
+    try {
+      for (const cmd of [
+        `grep -rn "touch" src/`,
+        `grep -rn "chmod" src/`,
+        `rg "touch"`,
+        `echo "touchscreen support"`,
+        `git commit -m "touch file"`,
+        `echo 'chmod is a command'`,
+      ]) {
+        expect(guardBashWrite(cmd, B, reg, dir).blocked).toBeUndefined();
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("verb asli + path klaim ber-quote = TETAP DIBLOKIR", () => {
+    const { reg, dir, cleanup } = r5();
+    try {
+      const P = join(dir, "src/a.ts");
+      expect(guardBashWrite(`rm "${P}"`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`touch '${P}'`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`chmod 644 "${P}"`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`echo mulai; rm "${P}"`, B, reg, dir).blocked).toContain("tugas-1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("redirect di dalam quote = LOLOS; redirect asli = DIBLOKIR", () => {
+    const { reg, dir, cleanup } = r5();
+    try {
+      const P = join(dir, "src/a.ts");
+      expect(guardBashWrite(`echo "a > b"`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`echo "save ke ${P}"`, B, reg, dir).blocked).toBeUndefined();
+      expect(guardBashWrite(`echo hi > "${P}"`, B, reg, dir).blocked).toContain("tugas-1");
+      expect(guardBashWrite(`cat x > ${P}`, B, reg, dir).blocked).toContain("tugas-1");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("index.ts v0.1.4 — konsistensi worktree/directory", () => {
+  test("claim → guard → release konsisten memakai tctx.directory", async () => {
+    const { OrkestraPlugin } = await import("./index");
+    const hooks = await OrkestraPlugin({ directory: "/wt/sub", worktree: "/wt" } as never);
+    const tools = hooks.tool!;
+    const before = hooks["tool.execute.before"]!;
+    const tctxA = { sessionID: "A", directory: "/wt/sub", worktree: "/wt" };
+    const tctxB = { sessionID: "B", directory: "/wt/sub", worktree: "/wt" };
+
+    const claimed = await tools.orkestra_claim.execute({ tugas: "t1", files: ["src/a.ts"] }, tctxA as never);
+    expect(String(claimed).startsWith("OK")).toBe(true);
+
+    // B menulis path relatif yang sama → harus DIBLOKIR (sebelum fix: lolos karena guard pakai directory, klaim pakai worktree)
+    let blocked = false;
+    try {
+      await before({ tool: "write", sessionID: "B", callID: "1" }, { args: { filePath: "src/a.ts" } });
+    } catch {
+      blocked = true;
+    }
+    expect(blocked).toBe(true);
+
+    // A melepas klaimnya sendiri via path relatif → harus berhasil (sebelum fix: 0, menggantung)
+    const released = await tools.orkestra_release.execute({ target: "src/a.ts" }, tctxA as never);
+    expect(String(released)).toContain("1 klaim");
+  });
+});

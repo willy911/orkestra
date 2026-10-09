@@ -79,7 +79,7 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
           files: tool.schema.array(tool.schema.string()).describe("Daftar file/direktori yang akan ditulis"),
         },
         async execute(args, tctx) {
-          const root = tctx.worktree || tctx.directory || projectDir;
+          const root = tctx.directory || tctx.worktree || projectDir;
           sessionDirs.set(tctx.sessionID, tctx.directory || projectDir);
           const res = registry.claim(args.files, args.tugas, tctx.sessionID, root);
           if (!res.ok) {
@@ -119,7 +119,7 @@ export const OrkestraPlugin: Plugin = async (ctx) => {
         description: "Lihat semua klaim file yang sedang aktif (tugas apa memegang file apa).",
         args: {},
         async execute(_args, tctx) {
-          const root = tctx.worktree || tctx.directory || projectDir;
+          const root = tctx.directory || tctx.worktree || projectDir;
           const list = registry.list();
           if (list.length === 0) return "Tidak ada klaim aktif. Semua file bebas ditulis.";
           return (

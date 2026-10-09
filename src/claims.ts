@@ -412,16 +412,40 @@ const XARGS_DESTRUCTIVE = /\bxargs\b[^|]*\b(rm|mv|unlink|shred|tee)\b/;
 const INTERP_RUN = /\b(python3?|node|ruby|php|perl)\b[^;&|]*?\s-[cer]\b/;
 const INTERP_WRITE_KW = /\bopen\s*\(|writeFile|write_text|file_put_contents|\bos\.(remove|unlink)|shutil|\bunlink\s*\(|\bfopen\s*\(/;
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Pecah command menjadi segmen mentah (tanpa dequoting) pada separator shell. */
+function rawSegments(cmd: string): string[] {
+  return cmd
+    .split(/[;&|\n()]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
-/** Pecah segmen command menjadi token, buang flag dan kutip pembungkus. */
-function shellTokens(seg: string): string[] {
-  return seg
-    .split(/\s+/)
-    .map((t) => t.replace(/^["']|["']$/g, ""))
-    .filter((t) => t.length > 0 && !t.startsWith("-"));
+/** Tokenisasi yang menghormati quote: `rm "my file.ts"` → ["rm", "my file.ts"]. */
+function quoteAwareTokens(s: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|\S+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) {
+    let t = m[0];
+    if (t.length >= 2 && ((t[0] === '"' && t[t.length - 1] === '"') || (t[0] === "'" && t[t.length - 1] === "'"))) {
+      t = t.slice(1, -1);
+    }
+    if (t.length > 0) out.push(t);
+  }
+  return out;
+}
+
+/** Rentang [awal, akhir) daerah ber-quote di dalam string. */
+function quotedRanges(s: string): [number, number][] {
+  const out: [number, number][] = [];
+  const re = /(["'])(?:(?!\1|\\).|\\.)*\1/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) out.push([m.index, m.index + m[0].length]);
+  return out;
+}
+
+function inRanges(pos: number, ranges: [number, number][]): boolean {
+  return ranges.some(([a, b]) => pos >= a && pos < b);
 }
 
 /** true bila token path (absolut/relatif thd cwd) bersinggungan dengan klaim. */
@@ -432,26 +456,57 @@ function tokenHitsClaim(tok: string, claimPath: string, cwd?: string): boolean {
   return overlaps(abs, claimPath);
 }
 
-/** Cek verb mutasi: apakah ada token targetnya yang mengenai klaim? */
+/**
+ * Cek verb mutasi: apakah ada token targetnya yang mengenai klaim?
+ * Verb hanya dihitung bila muncul di luar daerah ber-quote, sehingga
+ * `grep -rn "touch"` tidak terbaca sebagai perintah touch — tetapi path
+ * target diambil dari segmen asli dengan tokenisasi quote-aware, sehingga
+ * `rm "/claimed/a.ts"` tetap tertangkap.
+ */
 function verbTargetsClaim(cmd: string, claimPath: string, cwd?: string): boolean {
-  for (const { re, lastOnly, skipIf } of BASH_VERBS) {
-    const m = re.exec(cmd);
-    if (!m) continue;
-    const seg = cmd.slice(m.index + m[0].length, m.index + m[0].length + 300).split(/[;&|]/)[0];
-    if (skipIf && skipIf.test(seg)) continue;
-    let toks = shellTokens(seg);
-    if (lastOnly) toks = toks.slice(-1);
-    if (toks.some((t) => tokenHitsClaim(t, claimPath, cwd))) return true;
+  for (const seg of rawSegments(cmd)) {
+    const ranges = quotedRanges(seg);
+    for (const { re, lastOnly, skipIf } of BASH_VERBS) {
+      const m = firstUnquotedMatch(re, seg, ranges);
+      if (!m) continue;
+      const tail = seg.slice(m.index + m[0].length, m.index + m[0].length + 300).split(/[;&|]/)[0];
+      if (skipIf && skipIf.test(tail)) continue;
+      let toks = quoteAwareTokens(tail).filter((t) => !t.startsWith("-"));
+      if (lastOnly) toks = toks.slice(-1);
+      if (toks.some((t) => tokenHitsClaim(t, claimPath, cwd))) return true;
+    }
   }
   return false;
 }
 
-/** Cek redirect tulis (`>` / `>>` / `&>`) yang targetnya mengenai klaim. */
-function redirectTargetsClaim(cmd: string, claimPath: string, cwd?: string): boolean {
-  const re = /(^|[^>])&?>{1,2}\s*(["']?)([^\s;"'|]+)\2/g;
+/** Match pertama regex yang posisinya tidak berada di dalam daerah ber-quote. */
+function firstUnquotedMatch(re: RegExp, seg: string, ranges: [number, number][]): RegExpExecArray | null {
+  const gre = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
   let m: RegExpExecArray | null;
-  while ((m = re.exec(cmd))) {
-    if (tokenHitsClaim(m[3], claimPath, cwd)) return true;
+  while ((m = gre.exec(seg))) {
+    if (m[0].length === 0) {
+      gre.lastIndex++;
+      continue;
+    }
+    if (!inRanges(m.index, ranges)) return m;
+  }
+  return null;
+}
+
+/**
+ * Cek redirect tulis (`>` / `>>` / `&>`) yang targetnya mengenai klaim.
+ * Operator `>` di dalam quote (mis. `echo "a > b"`) diabaikan.
+ */
+function redirectTargetsClaim(cmd: string, claimPath: string, cwd?: string): boolean {
+  for (const seg of rawSegments(cmd)) {
+    const ranges = quotedRanges(seg);
+    const re = /(^|[^>])&?>{1,2}\s*(["']?)([^\s;"'|]+)\2/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(seg))) {
+      const opPos = m.index + (m[1] ? m[1].length : 0);
+      if (inRanges(opPos, ranges)) continue;
+      if (tokenHitsClaim(m[3], claimPath, cwd)) return true;
+    }
   }
   return false;
 }
